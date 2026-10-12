@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { Suspense } from "react";
 import { connection } from "next/server";
+import { requireUserId } from "@/lib/authz";
 import { getLesson } from "@/db/repositories";
 import { ExerciseRunner } from "@/components/ExerciseRunner";
 import { buttonClass } from "@/components/ui";
@@ -17,7 +18,8 @@ export default function LessonPracticePage({ params }: { params: Promise<{ id: s
 async function LessonPracticeView({ params }: { params: Promise<{ id: string }> }) {
   await connection();
   const { id } = await params;
-  const lesson = await getLesson(id);
+  const userId = await requireUserId();
+  const lesson = await getLesson(userId, id);
 
   if (!lesson) {
     return (

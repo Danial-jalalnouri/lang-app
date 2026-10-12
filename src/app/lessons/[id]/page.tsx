@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { Suspense } from "react";
 import { connection } from "next/server";
+import { requireUserId } from "@/lib/authz";
 import { getLesson } from "@/db/repositories";
 import { SpeakButton } from "@/components/SpeakButton";
 import { Card, LinkButton, PageHeader, ProgressBar, buttonClass } from "@/components/ui";
@@ -16,7 +17,8 @@ export default function LessonPage({ params }: { params: Promise<{ id: string }>
 async function LessonView({ params }: { params: Promise<{ id: string }> }) {
   await connection();
   const { id } = await params;
-  const lesson = await getLesson(id);
+  const userId = await requireUserId();
+  const lesson = await getLesson(userId, id);
 
   if (!lesson) {
     return (

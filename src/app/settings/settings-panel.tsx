@@ -25,7 +25,7 @@ export function SettingsPanel({ dbLabel }: { dbLabel: string }) {
     <div className="mx-auto max-w-2xl">
       <PageHeader
         title="Settings"
-        subtitle="DeutschStart v1 — no account, no payments; progress lives in your Neon Postgres database."
+        subtitle="Your progress is saved to your account in Neon Postgres — sign in anywhere to pick up where you left off."
       />
 
       <Card className="mb-4">

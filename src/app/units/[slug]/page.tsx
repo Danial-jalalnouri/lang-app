@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { Suspense } from "react";
 import { connection } from "next/server";
+import { requireUserId } from "@/lib/authz";
 import { getUnit } from "@/db/repositories";
 import { Card, LinkButton, PageHeader, ProgressBar, buttonClass } from "@/components/ui";
 
@@ -15,7 +16,8 @@ export default function UnitPage({ params }: { params: Promise<{ slug: string }>
 async function UnitView({ params }: { params: Promise<{ slug: string }> }) {
   await connection();
   const { slug } = await params;
-  const unit = await getUnit(slug);
+  const userId = await requireUserId();
+  const unit = await getUnit(userId, slug);
 
   if (!unit) {
     return (

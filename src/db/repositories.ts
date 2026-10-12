@@ -2,7 +2,7 @@ import { query, execute, withTransaction } from "./client";
 import type { Exercise, GrammarRule, VocabularyEntry } from "@/content/types";
 import { nextBox, nextDueAt, updateStreak } from "@/lib/srs";
 
-export const LOCAL_USER = "local";
+// Progress is keyed by Clerk user id (user_key column); content is shared.
 
 // ---------- row shapes ----------
 
@@ -120,12 +120,12 @@ export interface DashboardData {
   totalDue: number;
 }
 
-export async function getDashboard(): Promise<DashboardData> {
+export async function getDashboard(userId: string): Promise<DashboardData> {
   const [level] = await query<{ id: string; code: string; name: string }>(
     "SELECT id, code, name FROM levels ORDER BY order_index",
   );
   const units = await query<UnitRow>("SELECT * FROM units ORDER BY order_index");
-  const state = await getAppState();
+  const streakState = await getStreakState(userId);
   const { today, yesterday } = await dayKeys();
 
   const unitProgress: UnitProgress[] = [];
@@ -146,11 +146,11 @@ export async function getDashboard(): Promise<DashboardData> {
             WHERE l.unit_id = $1) AS total_exercises,
          (SELECT COUNT(*) FROM exercise_progress ep
             JOIN exercises e ON e.id = ep.exercise_id JOIN lessons l ON l.id = e.lesson_id
-            WHERE l.unit_id = $1 AND ep.correct_count + ep.wrong_count > 0) AS attempted_exercises,
+            WHERE l.unit_id = $1 AND ep.user_key = $2 AND ep.correct_count + ep.wrong_count > 0) AS attempted_exercises,
          (SELECT COUNT(*) FROM vocabulary WHERE unit_id = $1) AS total_words,
          (SELECT COUNT(*) FROM vocab_progress vp JOIN vocabulary v ON v.id = vp.vocab_id
-            WHERE v.unit_id = $1 AND vp.due_at <= now()) AS due_words`,
-      [u.id],
+            WHERE v.unit_id = $1 AND vp.user_key = $2 AND vp.due_at <= now()) AS due_words`,
+      [u.id, userId],
     );
     unitProgress.push({
       id: u.id,
@@ -168,16 +168,15 @@ export async function getDashboard(): Promise<DashboardData> {
 
   const [due] = await query<{ n: string }>(
     `SELECT COUNT(*) AS n FROM vocab_progress WHERE user_key = $1 AND due_at <= now()`,
-    [LOCAL_USER],
+    [userId],
   );
 
-  const lastDay = state.streak_last_day ?? null;
-  const streakActive = lastDay === today || lastDay === yesterday;
+  const streakActive = streakState.last === today || streakState.last === yesterday;
 
   return {
     level: level ?? { id: "a1", code: "A1", name: "A1 — Beginner" },
-    streak: streakActive ? Number(state.streak_current ?? 0) : 0,
-    bestStreak: Number(state.streak_best ?? 0),
+    streak: streakActive ? streakState.current : 0,
+    bestStreak: streakState.best,
     units: unitProgress,
     totalDue: Number(due?.n ?? 0),
   };
@@ -199,7 +198,7 @@ export interface UnitDetail {
   lessons: LessonSummary[];
 }
 
-export async function getUnit(slug: string): Promise<UnitDetail | null> {
+export async function getUnit(userId: string, slug: string): Promise<UnitDetail | null> {
   const [unit] = await query<UnitRow & { level_code: string }>(
     `SELECT u.*, l.code AS level_code FROM units u JOIN levels l ON l.id = u.level_id WHERE u.slug = $1`,
     [slug],
@@ -211,14 +210,15 @@ export async function getUnit(slug: string): Promise<UnitDetail | null> {
     const [stats] = await query<{ total_exercises: number; attempted: number; total_words: number }>(
       `SELECT
          (SELECT COUNT(*) FROM exercises WHERE lesson_id = $1) AS total_exercises,
-         (SELECT COUNT(*) FROM exercise_progress WHERE exercise_id IN (SELECT id FROM exercises WHERE lesson_id = $1)
-            AND correct_count + wrong_count > 0) AS attempted,
+         (SELECT COUNT(*) FROM exercise_progress ep WHERE ep.user_key = $2
+            AND ep.exercise_id IN (SELECT id FROM exercises WHERE lesson_id = $1)
+            AND ep.correct_count + ep.wrong_count > 0) AS attempted,
          (SELECT COUNT(*) FROM vocabulary WHERE lesson_id = $1) AS total_words`,
-      [l.id],
+      [l.id, userId],
     );
     const [lp] = await query<{ completed_at: Date | null; score: number }>(
       `SELECT completed_at, score FROM lesson_progress WHERE user_key = $1 AND lesson_id = $2`,
-      [LOCAL_USER, l.id],
+      [userId, l.id],
     );
     summaries.push({
       lesson: { id: l.id, slug: l.slug, titleEn: l.title_en, grammarSummaryEn: l.grammar_summary_en },
@@ -255,7 +255,7 @@ export interface LessonDetail {
   score: number;
 }
 
-export async function getLesson(id: string): Promise<LessonDetail | null> {
+export async function getLesson(userId: string, id: string): Promise<LessonDetail | null> {
   const [lesson] = await query<LessonRow & { unit_slug: string; unit_title: string }>(
     `SELECT l.*, u.slug AS unit_slug, u.title_en AS unit_title
      FROM lessons l JOIN units u ON u.id = l.unit_id WHERE l.id = $1 OR l.slug = $1`,
@@ -266,13 +266,15 @@ export async function getLesson(id: string): Promise<LessonDetail | null> {
   const vocab = await query<VocabRow>("SELECT * FROM vocabulary WHERE lesson_id = $1 ORDER BY id", [lesson.id]);
   const exercises = await query<ExerciseRow>("SELECT * FROM exercises WHERE lesson_id = $1 ORDER BY order_index", [lesson.id]);
   const [attempted] = await query<{ n: string }>(
-    `SELECT COUNT(*) AS n FROM exercise_progress
-     WHERE exercise_id IN (SELECT id FROM exercises WHERE lesson_id = $1) AND correct_count + wrong_count > 0`,
-    [lesson.id],
+    `SELECT COUNT(*) AS n FROM exercise_progress ep
+     WHERE ep.user_key = $2
+       AND ep.exercise_id IN (SELECT id FROM exercises WHERE lesson_id = $1)
+       AND ep.correct_count + ep.wrong_count > 0`,
+    [lesson.id, userId],
   );
   const [lp] = await query<{ completed_at: Date | null; score: number }>(
     `SELECT completed_at, score FROM lesson_progress WHERE user_key = $1 AND lesson_id = $2`,
-    [LOCAL_USER, lesson.id],
+    [userId, lesson.id],
   );
   return {
     unit: { id: lesson.unit_id, slug: lesson.unit_slug, titleEn: lesson.unit_title },
@@ -324,23 +326,23 @@ function toReviewWord(v: ReturnType<typeof parseVocab>): ReviewWord {
   };
 }
 
-export async function getDueWords(limit = 30): Promise<ReviewWord[]> {
+export async function getDueWords(userId: string, limit = 30): Promise<ReviewWord[]> {
   const rows = await query<VocabRow>(
     `SELECT v.* FROM vocab_progress vp JOIN vocabulary v ON v.id = vp.vocab_id
      WHERE vp.user_key = $1 AND vp.due_at <= now()
      ORDER BY vp.due_at LIMIT $2`,
-    [LOCAL_USER, limit],
+    [userId, limit],
   );
   return rows.map((r) => toReviewWord(parseVocab(r)));
 }
 
 /** Unseen words — the "learn new words" queue. */
-export async function getNewWords(limit = 20): Promise<ReviewWord[]> {
+export async function getNewWords(userId: string, limit = 20): Promise<ReviewWord[]> {
   const rows = await query<VocabRow>(
     `SELECT v.* FROM vocabulary v
      WHERE NOT EXISTS (SELECT 1 FROM vocab_progress vp WHERE vp.vocab_id = v.id AND vp.user_key = $1)
      ORDER BY v.unit_id, v.lesson_id, v.id LIMIT $2`,
-    [LOCAL_USER, limit],
+    [userId, limit],
   );
   return rows.map((r) => toReviewWord(parseVocab(r)));
 }
@@ -352,21 +354,21 @@ export interface ReviewStats {
   mastered: number;
 }
 
-export async function getReviewStats(): Promise<ReviewStats> {
+export async function getReviewStats(userId: string): Promise<ReviewStats> {
   const [due] = await query<{ n: string }>(
     `SELECT COUNT(*) AS n FROM vocab_progress WHERE user_key = $1 AND due_at <= now()`,
-    [LOCAL_USER],
+    [userId],
   );
   const [fresh] = await query<{ n: string }>(
     `SELECT COUNT(*) AS n FROM vocabulary v
      WHERE NOT EXISTS (SELECT 1 FROM vocab_progress vp WHERE vp.vocab_id = v.id AND vp.user_key = $1)`,
-    [LOCAL_USER],
+    [userId],
   );
   const [learned] = await query<{ n: string }>(
-    `SELECT COUNT(*) AS n FROM vocab_progress WHERE user_key = $1`, [LOCAL_USER],
+    `SELECT COUNT(*) AS n FROM vocab_progress WHERE user_key = $1`, [userId],
   );
   const [mastered] = await query<{ n: string }>(
-    `SELECT COUNT(*) AS n FROM vocab_progress WHERE user_key = $1 AND box >= 4`, [LOCAL_USER],
+    `SELECT COUNT(*) AS n FROM vocab_progress WHERE user_key = $1 AND box >= 4`, [userId],
   );
   return {
     due: Number(due?.n ?? 0),
@@ -376,32 +378,53 @@ export async function getReviewStats(): Promise<ReviewStats> {
   };
 }
 
-// ---------- app state (streak etc.) ----------
+// ---------- app state (per-user streak, etc.) ----------
 
-async function getAppState(): Promise<Record<string, string>> {
-  const rows = await query<{ key: string; value: string }>("SELECT key, value FROM app_meta");
-  return Object.fromEntries(rows.map((r) => [r.key, r.value]));
+interface StreakState {
+  current: number;
+  last: string | null;
+  best: number;
 }
 
-async function touchStreak(): Promise<void> {
-  const state = await getAppState();
-  const current = Number(state.streak_current ?? 0);
-  const last = state.streak_last_day ?? null;
+const EMPTY_STREAK: StreakState = { current: 0, last: null, best: 0 };
+
+function streakKey(userId: string): string {
+  return `streak:${userId}`;
+}
+
+async function getStreakState(userId: string): Promise<StreakState> {
+  const [row] = await query<{ value: string }>(
+    `SELECT value FROM app_meta WHERE key = $1`,
+    [streakKey(userId)],
+  );
+  if (!row) return EMPTY_STREAK;
+  try {
+    const parsed = JSON.parse(row.value) as Partial<StreakState>;
+    return {
+      current: Number(parsed.current ?? 0),
+      last: parsed.last ?? null,
+      best: Number(parsed.best ?? 0),
+    };
+  } catch {
+    return EMPTY_STREAK;
+  }
+}
+
+async function touchStreak(userId: string): Promise<void> {
+  const state = await getStreakState(userId);
   const { today } = await dayKeys();
-  const next = updateStreak(current, last, today);
-  const best = Math.max(Number(state.streak_best ?? 0), next);
-  const upsert = `INSERT INTO app_meta (key, value) VALUES ($1, $2)
-                  ON CONFLICT(key) DO UPDATE SET value = excluded.value`;
-  await withTransaction(async (c) => {
-    await c.query(upsert, ["streak_current", String(next)]);
-    await c.query(upsert, ["streak_last_day", today]);
-    await c.query(upsert, ["streak_best", String(best)]);
-  });
+  const next = updateStreak(state.current, state.last, today);
+  const best = Math.max(state.best, next);
+  await execute(
+    `INSERT INTO app_meta (key, value) VALUES ($1, $2)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    [streakKey(userId), JSON.stringify({ current: next, last: today, best })],
+  );
 }
 
 // ---------- write: progress ----------
 
-export async function recordExerciseResult(exerciseId: string, correct: boolean): Promise<void> {
+export async function recordExerciseResult(userId: string, exerciseId: string, correct: boolean): Promise<void> {
   await execute(
     `INSERT INTO exercise_progress (user_key, exercise_id, correct_count, wrong_count, streak, last_result, last_seen_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -411,15 +434,15 @@ export async function recordExerciseResult(exerciseId: string, correct: boolean)
        streak = CASE WHEN excluded.last_result = 1 THEN exercise_progress.streak + 1 ELSE 0 END,
        last_result = excluded.last_result,
        last_seen_at = excluded.last_seen_at`,
-    [LOCAL_USER, exerciseId, correct ? 1 : 0, correct ? 0 : 1, correct ? 1 : 0, correct ? 1 : 0, new Date().toISOString()],
+    [userId, exerciseId, correct ? 1 : 0, correct ? 0 : 1, correct ? 1 : 0, correct ? 1 : 0, new Date().toISOString()],
   );
-  await touchStreak();
+  await touchStreak(userId);
 }
 
-export async function recordVocabReview(vocabId: string, remembered: boolean): Promise<void> {
+export async function recordVocabReview(userId: string, vocabId: string, remembered: boolean): Promise<void> {
   const [existing] = await query<{ box: number }>(
     `SELECT box FROM vocab_progress WHERE user_key = $1 AND vocab_id = $2`,
-    [LOCAL_USER, vocabId],
+    [userId, vocabId],
   );
   const newBox = nextBox(Number(existing?.box ?? 0), remembered);
   await execute(
@@ -432,15 +455,15 @@ export async function recordVocabReview(vocabId: string, remembered: boolean): P
        due_at = excluded.due_at,
        last_seen_at = excluded.last_seen_at`,
     [
-      LOCAL_USER, vocabId, newBox,
+      userId, vocabId, newBox,
       remembered ? 1 : 0, remembered ? 0 : 1,
       nextDueAt(newBox), new Date().toISOString(),
     ],
   );
-  await touchStreak();
+  await touchStreak(userId);
 }
 
-export async function recordLessonCompletion(lessonId: string, score: number): Promise<void> {
+export async function recordLessonCompletion(userId: string, lessonId: string, score: number): Promise<void> {
   await execute(
     `INSERT INTO lesson_progress (user_key, lesson_id, completed_at, score, attempts)
      VALUES ($1, $2, $3, $4, 1)
@@ -448,16 +471,16 @@ export async function recordLessonCompletion(lessonId: string, score: number): P
        completed_at = COALESCE(excluded.completed_at, lesson_progress.completed_at),
        score = GREATEST(lesson_progress.score, excluded.score),
        attempts = lesson_progress.attempts + 1`,
-    [LOCAL_USER, lessonId, new Date().toISOString(), score],
+    [userId, lessonId, new Date().toISOString(), score],
   );
-  await touchStreak();
+  await touchStreak(userId);
 }
 
-export async function resetProgress(): Promise<void> {
+export async function resetProgress(userId: string): Promise<void> {
   await withTransaction(async (c) => {
-    await c.query(`DELETE FROM exercise_progress WHERE user_key = $1`, [LOCAL_USER]);
-    await c.query(`DELETE FROM vocab_progress WHERE user_key = $1`, [LOCAL_USER]);
-    await c.query(`DELETE FROM lesson_progress WHERE user_key = $1`, [LOCAL_USER]);
-    await c.query(`DELETE FROM app_meta WHERE key LIKE 'streak%'`);
+    await c.query(`DELETE FROM exercise_progress WHERE user_key = $1`, [userId]);
+    await c.query(`DELETE FROM vocab_progress WHERE user_key = $1`, [userId]);
+    await c.query(`DELETE FROM lesson_progress WHERE user_key = $1`, [userId]);
+    await c.query(`DELETE FROM app_meta WHERE key = $1`, [streakKey(userId)]);
   });
 }

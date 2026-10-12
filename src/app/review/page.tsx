@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { Suspense } from "react";
 import { connection } from "next/server";
+import { requireUserId } from "@/lib/authz";
 import { getDueWords, getNewWords, getReviewStats } from "@/db/repositories";
 import { FlashcardReview } from "@/components/FlashcardReview";
 import { Card, PageHeader, Stat, buttonClass } from "@/components/ui";
@@ -15,7 +16,8 @@ export default function ReviewPage() {
 
 async function ReviewView() {
   await connection();
-  const stats = await getReviewStats();
+  const userId = await requireUserId();
+  const stats = await getReviewStats(userId);
 
   if (stats.due === 0 && stats.newWords === 0) {
     return (
@@ -39,8 +41,8 @@ async function ReviewView() {
     );
   }
 
-  const due = await getDueWords(30);
-  const fresh = stats.due < 30 ? await getNewWords(20 - Math.min(stats.due, 10)) : [];
+  const due = await getDueWords(userId, 30);
+  const fresh = stats.due < 30 ? await getNewWords(userId, 20 - Math.min(stats.due, 10)) : [];
   const words = [...due, ...fresh];
 
   return (

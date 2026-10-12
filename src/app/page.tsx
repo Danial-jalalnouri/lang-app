@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { Suspense } from "react";
 import { connection } from "next/server";
+import { requireUserId } from "@/lib/authz";
 import { getDashboard } from "@/db/repositories";
 import { Card, LinkButton, PageHeader, ProgressBar, Stat, buttonClass, cn } from "@/components/ui";
 
@@ -14,7 +15,8 @@ export default function DashboardPage() {
 
 async function DashboardView() {
   await connection();
-  const data = await getDashboard();
+  const userId = await requireUserId();
+  const data = await getDashboard(userId);
 
   if (data.units.length === 0) {
     return (

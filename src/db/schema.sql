@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS exercises (
   order_index INTEGER NOT NULL DEFAULT 0
 );
 
--- Runtime: single local user for v1; user_key becomes a real FK when auth arrives.
+-- Runtime: progress is per-user (Clerk user id in user_key).
 CREATE TABLE IF NOT EXISTS exercise_progress (
   user_key TEXT NOT NULL DEFAULT 'local',
   exercise_id TEXT NOT NULL REFERENCES exercises(id) ON DELETE CASCADE,
