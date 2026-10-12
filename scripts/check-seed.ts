@@ -1,5 +1,5 @@
 /** Asserts every seeded exercise row parses back into a well-formed exercise. */
-import { getDb } from "../src/db/client";
+import { query, getPool } from "../src/db/client";
 
 const NEEDS: Record<string, string[]> = {
   typing: ["answer"],
@@ -11,13 +11,14 @@ const NEEDS: Record<string, string[]> = {
 };
 
 async function main() {
-  const db = getDb();
-  const r = await db.execute("SELECT id, type, payload, answer FROM exercises");
+  const rows = await query<{ id: string; type: string; payload: string; answer: string }>(
+    "SELECT id, type, payload, answer FROM exercises",
+  );
   let bad = 0;
-  for (const row of r.rows) {
-    const p = JSON.parse(String(row.payload));
-    const a = JSON.parse(String(row.answer));
-    for (const k of NEEDS[String(row.type)] ?? []) {
+  for (const row of rows) {
+    const p = JSON.parse(row.payload);
+    const a = JSON.parse(row.answer);
+    for (const k of NEEDS[row.type] ?? []) {
       if (a[k] === undefined && p[k] === undefined) {
         console.log("MISSING", row.type, row.id, k);
         bad++;
@@ -28,6 +29,8 @@ async function main() {
     console.error(`${bad} malformed exercises`);
     process.exit(1);
   }
-  console.log(`✓ all ${r.rows.length} seeded exercises well-formed`);
+  console.log(`✓ all ${rows.length} seeded exercises well-formed`);
 }
-main().catch((e) => { console.error(e); process.exit(1); });
+main()
+  .then(() => getPool().end())
+  .catch((e) => { console.error(e); process.exit(1); });

@@ -1,49 +1,75 @@
-import { createClient, type Client } from "@libsql/client";
-import { mkdirSync, readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { Pool, type PoolClient, type QueryResultRow } from "pg";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
-const DEFAULT_FILE_URL = "file:data/dev.db";
-
-function connectionConfig() {
-  const url = process.env.TURSO_DATABASE_URL ?? DEFAULT_FILE_URL;
-  if (url.startsWith("file:")) {
-    const path = resolve(url.slice("file:".length));
-    mkdirSync(dirname(path), { recursive: true });
-    return { url: `file:${path}` };
+// Scripts run via tsx don't get Next's .env.local loading — load it once as fallback.
+if (!process.env.DATABASE_URL && !process.env.DATABASE_URL_UNPOOLED) {
+  try {
+    process.loadEnvFile(resolve(process.cwd(), ".env.local"));
+  } catch {
+    // no .env.local — env must come from the process (e.g. Vercel)
   }
-  return { url, authToken: process.env.TURSO_AUTH_TOKEN };
 }
 
-const globalForDb = globalThis as unknown as { __db?: Client; __dbReady?: Promise<void> };
-
-export function getDb(): Client {
-  if (!globalForDb.__db) {
-    globalForDb.__db = createClient(connectionConfig());
+function connectionString(): string {
+  // Prefer the pooled endpoint for the app (serverless-friendly);
+  // DATABASE_URL_UNPOOLED is available for heavy one-off jobs.
+  const url = process.env.DATABASE_URL ?? process.env.DATABASE_URL_UNPOOLED;
+  if (!url) {
+    throw new Error(
+      "Missing DATABASE_URL — run `neon link` (writes .env.local) or set it in your environment.",
+    );
   }
-  return globalForDb.__db;
+  return url;
+}
+
+const globalForDb = globalThis as unknown as {
+  __pgPool?: Pool;
+  __pgSchemaReady?: Promise<void>;
+};
+
+export function getPool(): Pool {
+  if (!globalForDb.__pgPool) {
+    globalForDb.__pgPool = new Pool({ connectionString: connectionString(), max: 5 });
+  }
+  return globalForDb.__pgPool;
 }
 
 export function ensureSchema(): Promise<void> {
-  if (!globalForDb.__dbReady) {
-    const db = getDb();
-    const schema = readFileSync(
-      resolve(process.cwd(), "src/db/schema.sql"),
-      "utf-8",
-    );
-    globalForDb.__dbReady = db.executeMultiple(schema).then(() => undefined);
+  if (!globalForDb.__pgSchemaReady) {
+    const schema = readFileSync(resolve(process.cwd(), "src/db/schema.sql"), "utf-8");
+    globalForDb.__pgSchemaReady = getPool()
+      .query(schema)
+      .then(() => undefined);
   }
-  return globalForDb.__dbReady;
+  return globalForDb.__pgSchemaReady;
 }
 
-export type SqlArgs = unknown[] | Record<string, unknown>;
-
-export async function query<T>(sql: string, args: SqlArgs = []): Promise<T[]> {
+/** Positional-parameter query ($1, $2, …). */
+export async function query<T = QueryResultRow>(sql: string, params: unknown[] = []): Promise<T[]> {
   await ensureSchema();
-  const result = await getDb().execute({ sql, args: args as never });
-  return result.rows as unknown as T[];
+  const res = await getPool().query(sql, params);
+  return res.rows as unknown as T[];
 }
 
-export async function execute(sql: string, args: SqlArgs = []): Promise<void> {
+export async function execute(sql: string, params: unknown[] = []): Promise<void> {
   await ensureSchema();
-  await getDb().execute({ sql, args: args as never });
+  await getPool().query(sql, params);
+}
+
+/** Runs fn inside a BEGIN/COMMIT transaction on a dedicated connection. */
+export async function withTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+  await ensureSchema();
+  const client = await getPool().connect();
+  try {
+    await client.query("BEGIN");
+    const out = await fn(client);
+    await client.query("COMMIT");
+    return out;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }

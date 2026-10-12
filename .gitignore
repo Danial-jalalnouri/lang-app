@@ -40,6 +40,9 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# local database
-/data/
 .playwright-mcp/
+.neon
+
+# agent tooling (reinstall with `neon skills -y`)
+.agents/
+skills-lock.json

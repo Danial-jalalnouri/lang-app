@@ -1,7 +1,5 @@
--- DeutschStart v1 schema (SQLite / libSQL compatible)
+-- DeutschStart v1 schema (Postgres / Neon)
 -- All content tables are seeded from src/content; progress tables are runtime-owned.
-
-PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS app_meta (
   key TEXT PRIMARY KEY,
@@ -76,7 +74,7 @@ CREATE TABLE IF NOT EXISTS exercise_progress (
   wrong_count INTEGER NOT NULL DEFAULT 0,
   streak INTEGER NOT NULL DEFAULT 0,
   last_result INTEGER,
-  last_seen_at TEXT,
+  last_seen_at TIMESTAMPTZ,
   PRIMARY KEY (user_key, exercise_id)
 );
 
@@ -86,16 +84,16 @@ CREATE TABLE IF NOT EXISTS vocab_progress (
   box INTEGER NOT NULL DEFAULT 0,
   correct_count INTEGER NOT NULL DEFAULT 0,
   wrong_count INTEGER NOT NULL DEFAULT 0,
-  due_at TEXT NOT NULL,
-  last_seen_at TEXT,
+  due_at TIMESTAMPTZ NOT NULL,
+  last_seen_at TIMESTAMPTZ,
   PRIMARY KEY (user_key, vocab_id)
 );
 
 CREATE TABLE IF NOT EXISTS lesson_progress (
   user_key TEXT NOT NULL DEFAULT 'local',
   lesson_id TEXT NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
-  completed_at TEXT,
-  score REAL NOT NULL DEFAULT 0,
+  completed_at TIMESTAMPTZ,
+  score DOUBLE PRECISION NOT NULL DEFAULT 0,
   attempts INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (user_key, lesson_id)
 );

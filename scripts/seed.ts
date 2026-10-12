@@ -1,10 +1,10 @@
 /**
- * Idempotent seeder: loads src/content into SQLite.
+ * Idempotent seeder: loads src/content into Postgres (Neon).
  *   npm run seed            apply changes
  *   npm run seed:dry        show what would change without writing
  * Never touches progress tables — learner data survives re-seeds.
  */
-import { getDb, ensureSchema } from "../src/db/client";
+import { query, ensureSchema, withTransaction, getPool } from "../src/db/client";
 import { levelA1 } from "../src/content/a1";
 import type { Exercise, LessonContent } from "../src/content/types";
 
@@ -91,9 +91,11 @@ const content = {
 };
 type Table = keyof typeof content;
 
-function upsertSql(table: Table, cols: string, placeholders: string): string {
-  const updates = cols.split(",").slice(1).map((x) => `${x.trim()}=excluded.${x.trim()}`).join(",");
-  return `INSERT INTO ${table} (${cols}) VALUES (${placeholders}) ON CONFLICT(id) DO UPDATE SET ${updates}`;
+function upsertSql(table: Table, cols: string): string {
+  const names = cols.split(",").map((x) => x.trim());
+  const placeholders = names.map((_, i) => `$${i + 1}`).join(", ");
+  const updates = names.slice(1).map((x) => `${x}=excluded.${x}`).join(", ");
+  return `INSERT INTO ${table} (${names.join(", ")}) VALUES (${placeholders}) ON CONFLICT(id) DO UPDATE SET ${updates}`;
 }
 
 const COLUMNS: Record<Table, string> = {
@@ -105,31 +107,31 @@ const COLUMNS: Record<Table, string> = {
   exercises: "id, lesson_id, type, prompt, payload, answer, order_index",
 };
 
+type Exec = (sql: string, params?: unknown[]) => Promise<{ rows: Record<string, unknown>[] }>;
+
 /** Existing row ids that belong to this level's scope (so we only delete our own orphans). */
-async function scopedIds(table: Table): Promise<Set<string>> {
-  const db = getDb();
-  const byLevel = (sql: string) => db.execute({ sql, args: [level.id] });
-  let res;
+async function scopedIds(table: Table, exec: Exec): Promise<Set<string>> {
+  let rows: Record<string, unknown>[];
   switch (table) {
     case "levels":
       return new Set([level.id]);
     case "units":
-      res = await byLevel(`SELECT id FROM units WHERE level_id = ?`);
+      rows = (await exec(`SELECT id FROM units WHERE level_id = $1`, [level.id])).rows;
       break;
     case "lessons":
-      res = await byLevel(`SELECT l.id FROM lessons l JOIN units u ON u.id = l.unit_id WHERE u.level_id = ?`);
+      rows = (await exec(`SELECT l.id FROM lessons l JOIN units u ON u.id = l.unit_id WHERE u.level_id = $1`, [level.id])).rows;
       break;
     case "vocabulary":
-      res = await byLevel(`SELECT v.id FROM vocabulary v JOIN units u ON u.id = v.unit_id WHERE u.level_id = ?`);
+      rows = (await exec(`SELECT v.id FROM vocabulary v JOIN units u ON u.id = v.unit_id WHERE u.level_id = $1`, [level.id])).rows;
       break;
     case "grammar_rules":
-      res = await byLevel(`SELECT g.id FROM grammar_rules g JOIN lessons l ON l.id = g.lesson_id JOIN units u ON u.id = l.unit_id WHERE u.level_id = ?`);
+      rows = (await exec(`SELECT g.id FROM grammar_rules g JOIN lessons l ON l.id = g.lesson_id JOIN units u ON u.id = l.unit_id WHERE u.level_id = $1`, [level.id])).rows;
       break;
     case "exercises":
-      res = await byLevel(`SELECT e.id FROM exercises e JOIN lessons l ON l.id = e.lesson_id JOIN units u ON u.id = l.unit_id WHERE u.level_id = ?`);
+      rows = (await exec(`SELECT e.id FROM exercises e JOIN lessons l ON l.id = e.lesson_id JOIN units u ON u.id = l.unit_id WHERE u.level_id = $1`, [level.id])).rows;
       break;
   }
-  return new Set(res!.rows.map((r) => String(r.id)));
+  return new Set(rows!.map((r) => String(r.id)));
 }
 
 function fp(values: unknown[]): string {
@@ -138,19 +140,19 @@ function fp(values: unknown[]): string {
 
 async function main() {
   await ensureSchema();
-  const db = getDb();
 
   if (DRY) {
     console.log("\nDRY RUN — no changes written\n");
     console.log("table            +insert  ~update  =same  -delete");
     for (const table of Object.keys(content) as Table[]) {
-      const res = await db.execute(`SELECT * FROM ${table}`);
+      const rows = await query<Record<string, unknown>>(`SELECT * FROM ${table}`);
       const existing = new Map<string, string>();
-      for (const row of res.rows) {
-        const r = row as Record<string, unknown>;
+      for (const r of rows) {
         existing.set(String(r.id), fp(Object.keys(r).filter((k) => k !== "id").map((k) => r[k])));
       }
-      const scope = await scopedIds(table);
+      const scope = await scopedIds(table, async (sql, params) => ({
+        rows: await query<Record<string, unknown>>(sql, params),
+      }));
       let ins = 0, upd = 0, same = 0;
       const keep = new Set<string>();
       for (const row of content[table]) {
@@ -170,40 +172,30 @@ async function main() {
     return;
   }
 
-  const tx = await db.transaction("write");
-  try {
+  await withTransaction(async (c) => {
     for (const table of Object.keys(content) as Table[]) {
-      const cols = COLUMNS[table];
-      const placeholders = cols.split(",").map(() => "?").join(", ");
-      const sql = upsertSql(table, cols, placeholders);
+      const sql = upsertSql(table, COLUMNS[table]);
       for (const row of content[table]) {
-        await tx.execute({ sql, args: row as never[] });
+        await c.query(sql, row);
       }
     }
 
     // Delete rows that no longer exist in source content (scoped to this level).
     for (const table of ["exercises", "grammar_rules", "vocabulary", "lessons", "units"] as Table[]) {
-      const scope = await scopedIds(table);
+      const scope = await scopedIds(table, (sql, params) => c.query(sql, params));
       const keep = new Set(content[table].map((r) => String(r[0])));
       const gone = [...scope].filter((id) => !keep.has(id));
       if (gone.length > 0) {
-        await tx.execute({
-          sql: `DELETE FROM ${table} WHERE id IN (${gone.map(() => "?").join(",")})`,
-          args: gone as never[],
-        });
+        await c.query(`DELETE FROM ${table} WHERE id = ANY($1)`, [gone]);
       }
     }
 
-    await tx.execute({
-      sql: `INSERT INTO app_meta (key, value) VALUES ('seeded_at', ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-      args: [new Date().toISOString()],
-    });
-    await tx.commit();
-  } catch (err) {
-    await tx.rollback();
-    throw err;
-  }
+    await c.query(
+      `INSERT INTO app_meta (key, value) VALUES ('seeded_at', $1)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      [new Date().toISOString()],
+    );
+  });
 
   console.log(
     `Seeded: ${units.length} units · ${lessons.length} lessons · ` +
@@ -213,7 +205,9 @@ async function main() {
   );
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main()
+  .then(() => getPool().end())
+  .catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });

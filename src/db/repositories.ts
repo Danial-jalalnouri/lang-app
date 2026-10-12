@@ -1,6 +1,6 @@
-import { query, execute, getDb } from "./client";
+import { query, execute, withTransaction } from "./client";
 import type { Exercise, GrammarRule, VocabularyEntry } from "@/content/types";
-import { nextBox, nextDueAt, dayKey, updateStreak } from "@/lib/srs";
+import { nextBox, nextDueAt, updateStreak } from "@/lib/srs";
 
 export const LOCAL_USER = "local";
 
@@ -86,19 +86,12 @@ function parseGrammar(row: GrammarRow): GrammarRule {
   };
 }
 
-// Time comes from SQLite, never JS Date: Next.js Cache Components forbids
-// unstable JS time APIs on the render/prerender path.
-interface NowParts {
-  now: string;
-  today: string;
-  yesterday: string;
-}
-
-async function nowParts(): Promise<NowParts> {
-  const [r] = await query<NowParts>(
-    `SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS now,
-            strftime('%Y-%m-%d', 'now') AS today,
-            strftime('%Y-%m-%d', 'now', '-1 day') AS yesterday`,
+// Time comes from Postgres, never JS Date: Next.js Cache Components forbids
+// JS time APIs on the render/prerender path. All due-date checks use SQL now().
+async function dayKeys(): Promise<{ today: string; yesterday: string }> {
+  const [r] = await query<{ today: string; yesterday: string }>(
+    `SELECT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD') AS today,
+            to_char((now() AT TIME ZONE 'utc') - interval '1 day', 'YYYY-MM-DD') AS yesterday`,
   );
   if (!r) throw new Error("database clock unavailable");
   return r;
@@ -133,7 +126,7 @@ export async function getDashboard(): Promise<DashboardData> {
   );
   const units = await query<UnitRow>("SELECT * FROM units ORDER BY order_index");
   const state = await getAppState();
-  const { now, today, yesterday } = await nowParts();
+  const { today, yesterday } = await dayKeys();
 
   const unitProgress: UnitProgress[] = [];
   for (const u of units) {
@@ -146,18 +139,18 @@ export async function getDashboard(): Promise<DashboardData> {
       due_words: number;
     }>(
       `SELECT
-         (SELECT COUNT(*) FROM lessons WHERE unit_id = :id) AS total_lessons,
+         (SELECT COUNT(*) FROM lessons WHERE unit_id = $1) AS total_lessons,
          (SELECT COUNT(*) FROM lesson_progress lp JOIN lessons l ON l.id = lp.lesson_id
-            WHERE l.unit_id = :id AND lp.completed_at IS NOT NULL) AS completed_lessons,
+            WHERE l.unit_id = $1 AND lp.completed_at IS NOT NULL) AS completed_lessons,
          (SELECT COUNT(*) FROM exercises e JOIN lessons l ON l.id = e.lesson_id
-            WHERE l.unit_id = :id) AS total_exercises,
+            WHERE l.unit_id = $1) AS total_exercises,
          (SELECT COUNT(*) FROM exercise_progress ep
             JOIN exercises e ON e.id = ep.exercise_id JOIN lessons l ON l.id = e.lesson_id
-            WHERE l.unit_id = :id AND ep.correct_count + ep.wrong_count > 0) AS attempted_exercises,
-         (SELECT COUNT(*) FROM vocabulary WHERE unit_id = :id) AS total_words,
+            WHERE l.unit_id = $1 AND ep.correct_count + ep.wrong_count > 0) AS attempted_exercises,
+         (SELECT COUNT(*) FROM vocabulary WHERE unit_id = $1) AS total_words,
          (SELECT COUNT(*) FROM vocab_progress vp JOIN vocabulary v ON v.id = vp.vocab_id
-            WHERE v.unit_id = :id AND vp.due_at <= :now) AS due_words`,
-      { id: u.id, now },
+            WHERE v.unit_id = $1 AND vp.due_at <= now()) AS due_words`,
+      [u.id],
     );
     unitProgress.push({
       id: u.id,
@@ -173,9 +166,9 @@ export async function getDashboard(): Promise<DashboardData> {
     });
   }
 
-  const [due] = await query<{ n: number }>(
-    `SELECT COUNT(*) AS n FROM vocab_progress WHERE user_key = ? AND due_at <= ?`,
-    [LOCAL_USER, now],
+  const [due] = await query<{ n: string }>(
+    `SELECT COUNT(*) AS n FROM vocab_progress WHERE user_key = $1 AND due_at <= now()`,
+    [LOCAL_USER],
   );
 
   const lastDay = state.streak_last_day ?? null;
@@ -208,23 +201,23 @@ export interface UnitDetail {
 
 export async function getUnit(slug: string): Promise<UnitDetail | null> {
   const [unit] = await query<UnitRow & { level_code: string }>(
-    `SELECT u.*, l.code AS level_code FROM units u JOIN levels l ON l.id = u.level_id WHERE u.slug = ?`,
+    `SELECT u.*, l.code AS level_code FROM units u JOIN levels l ON l.id = u.level_id WHERE u.slug = $1`,
     [slug],
   );
   if (!unit) return null;
-  const lessons = await query<LessonRow>("SELECT * FROM lessons WHERE unit_id = ? ORDER BY order_index", [unit.id]);
+  const lessons = await query<LessonRow>("SELECT * FROM lessons WHERE unit_id = $1 ORDER BY order_index", [unit.id]);
   const summaries: LessonSummary[] = [];
   for (const l of lessons) {
     const [stats] = await query<{ total_exercises: number; attempted: number; total_words: number }>(
       `SELECT
-         (SELECT COUNT(*) FROM exercises WHERE lesson_id = :id) AS total_exercises,
-         (SELECT COUNT(*) FROM exercise_progress WHERE exercise_id IN (SELECT id FROM exercises WHERE lesson_id = :id)
+         (SELECT COUNT(*) FROM exercises WHERE lesson_id = $1) AS total_exercises,
+         (SELECT COUNT(*) FROM exercise_progress WHERE exercise_id IN (SELECT id FROM exercises WHERE lesson_id = $1)
             AND correct_count + wrong_count > 0) AS attempted,
-         (SELECT COUNT(*) FROM vocabulary WHERE lesson_id = :id) AS total_words`,
-      { id: l.id },
+         (SELECT COUNT(*) FROM vocabulary WHERE lesson_id = $1) AS total_words`,
+      [l.id],
     );
-    const [lp] = await query<{ completed_at: string | null; score: number }>(
-      `SELECT completed_at, score FROM lesson_progress WHERE user_key = ? AND lesson_id = ?`,
+    const [lp] = await query<{ completed_at: Date | null; score: number }>(
+      `SELECT completed_at, score FROM lesson_progress WHERE user_key = $1 AND lesson_id = $2`,
       [LOCAL_USER, l.id],
     );
     summaries.push({
@@ -265,20 +258,20 @@ export interface LessonDetail {
 export async function getLesson(id: string): Promise<LessonDetail | null> {
   const [lesson] = await query<LessonRow & { unit_slug: string; unit_title: string }>(
     `SELECT l.*, u.slug AS unit_slug, u.title_en AS unit_title
-     FROM lessons l JOIN units u ON u.id = l.unit_id WHERE l.id = ? OR l.slug = ?`,
-    [id, id],
+     FROM lessons l JOIN units u ON u.id = l.unit_id WHERE l.id = $1 OR l.slug = $1`,
+    [id],
   );
   if (!lesson) return null;
-  const grammar = await query<GrammarRow>("SELECT * FROM grammar_rules WHERE lesson_id = ? ORDER BY order_index", [lesson.id]);
-  const vocab = await query<VocabRow>("SELECT * FROM vocabulary WHERE lesson_id = ? ORDER BY id", [lesson.id]);
-  const exercises = await query<ExerciseRow>("SELECT * FROM exercises WHERE lesson_id = ? ORDER BY order_index", [lesson.id]);
-  const [attempted] = await query<{ n: number }>(
+  const grammar = await query<GrammarRow>("SELECT * FROM grammar_rules WHERE lesson_id = $1 ORDER BY order_index", [lesson.id]);
+  const vocab = await query<VocabRow>("SELECT * FROM vocabulary WHERE lesson_id = $1 ORDER BY id", [lesson.id]);
+  const exercises = await query<ExerciseRow>("SELECT * FROM exercises WHERE lesson_id = $1 ORDER BY order_index", [lesson.id]);
+  const [attempted] = await query<{ n: string }>(
     `SELECT COUNT(*) AS n FROM exercise_progress
-     WHERE exercise_id IN (SELECT id FROM exercises WHERE lesson_id = ?) AND correct_count + wrong_count > 0`,
+     WHERE exercise_id IN (SELECT id FROM exercises WHERE lesson_id = $1) AND correct_count + wrong_count > 0`,
     [lesson.id],
   );
-  const [lp] = await query<{ completed_at: string | null; score: number }>(
-    `SELECT completed_at, score FROM lesson_progress WHERE user_key = ? AND lesson_id = ?`,
+  const [lp] = await query<{ completed_at: Date | null; score: number }>(
+    `SELECT completed_at, score FROM lesson_progress WHERE user_key = $1 AND lesson_id = $2`,
     [LOCAL_USER, lesson.id],
   );
   return {
@@ -295,11 +288,11 @@ export async function getLesson(id: string): Promise<LessonDetail | null> {
 }
 
 export async function getUnitExercises(unitId: string): Promise<{ unit: { id: string; slug: string; titleEn: string }; exercises: Exercise[] } | null> {
-  const [unit] = await query<UnitRow>("SELECT * FROM units WHERE id = ?", [unitId]);
+  const [unit] = await query<UnitRow>("SELECT * FROM units WHERE id = $1", [unitId]);
   if (!unit) return null;
   const rows = await query<ExerciseRow>(
     `SELECT e.* FROM exercises e JOIN lessons l ON l.id = e.lesson_id
-     WHERE l.unit_id = ? ORDER BY l.order_index, e.order_index`,
+     WHERE l.unit_id = $1 ORDER BY l.order_index, e.order_index`,
     [unitId],
   );
   return { unit: { id: unit.id, slug: unit.slug, titleEn: unit.title_en }, exercises: rows.map(parseExercise) };
@@ -334,8 +327,8 @@ function toReviewWord(v: ReturnType<typeof parseVocab>): ReviewWord {
 export async function getDueWords(limit = 30): Promise<ReviewWord[]> {
   const rows = await query<VocabRow>(
     `SELECT v.* FROM vocab_progress vp JOIN vocabulary v ON v.id = vp.vocab_id
-     WHERE vp.user_key = ? AND vp.due_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-     ORDER BY vp.due_at LIMIT ?`,
+     WHERE vp.user_key = $1 AND vp.due_at <= now()
+     ORDER BY vp.due_at LIMIT $2`,
     [LOCAL_USER, limit],
   );
   return rows.map((r) => toReviewWord(parseVocab(r)));
@@ -345,8 +338,8 @@ export async function getDueWords(limit = 30): Promise<ReviewWord[]> {
 export async function getNewWords(limit = 20): Promise<ReviewWord[]> {
   const rows = await query<VocabRow>(
     `SELECT v.* FROM vocabulary v
-     WHERE NOT EXISTS (SELECT 1 FROM vocab_progress vp WHERE vp.vocab_id = v.id AND vp.user_key = ?)
-     ORDER BY v.unit_id, v.lesson_id, v.id LIMIT ?`,
+     WHERE NOT EXISTS (SELECT 1 FROM vocab_progress vp WHERE vp.vocab_id = v.id AND vp.user_key = $1)
+     ORDER BY v.unit_id, v.lesson_id, v.id LIMIT $2`,
     [LOCAL_USER, limit],
   );
   return rows.map((r) => toReviewWord(parseVocab(r)));
@@ -360,21 +353,20 @@ export interface ReviewStats {
 }
 
 export async function getReviewStats(): Promise<ReviewStats> {
-  const [due] = await query<{ n: number }>(
-    `SELECT COUNT(*) AS n FROM vocab_progress
-     WHERE user_key = ? AND due_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+  const [due] = await query<{ n: string }>(
+    `SELECT COUNT(*) AS n FROM vocab_progress WHERE user_key = $1 AND due_at <= now()`,
     [LOCAL_USER],
   );
-  const [fresh] = await query<{ n: number }>(
+  const [fresh] = await query<{ n: string }>(
     `SELECT COUNT(*) AS n FROM vocabulary v
-     WHERE NOT EXISTS (SELECT 1 FROM vocab_progress vp WHERE vp.vocab_id = v.id AND vp.user_key = ?)`,
+     WHERE NOT EXISTS (SELECT 1 FROM vocab_progress vp WHERE vp.vocab_id = v.id AND vp.user_key = $1)`,
     [LOCAL_USER],
   );
-  const [learned] = await query<{ n: number }>(
-    `SELECT COUNT(*) AS n FROM vocab_progress WHERE user_key = ?`, [LOCAL_USER],
+  const [learned] = await query<{ n: string }>(
+    `SELECT COUNT(*) AS n FROM vocab_progress WHERE user_key = $1`, [LOCAL_USER],
   );
-  const [mastered] = await query<{ n: number }>(
-    `SELECT COUNT(*) AS n FROM vocab_progress WHERE user_key = ? AND box >= 4`, [LOCAL_USER],
+  const [mastered] = await query<{ n: string }>(
+    `SELECT COUNT(*) AS n FROM vocab_progress WHERE user_key = $1 AND box >= 4`, [LOCAL_USER],
   );
   return {
     due: Number(due?.n ?? 0),
@@ -395,17 +387,16 @@ async function touchStreak(): Promise<void> {
   const state = await getAppState();
   const current = Number(state.streak_current ?? 0);
   const last = state.streak_last_day ?? null;
-  const next = updateStreak(current, last);
+  const { today } = await dayKeys();
+  const next = updateStreak(current, last, today);
   const best = Math.max(Number(state.streak_best ?? 0), next);
-  const today = dayKey();
-  await getDb().batch(
-    [
-      { sql: `INSERT INTO app_meta (key, value) VALUES ('streak_current', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, args: [String(next)] },
-      { sql: `INSERT INTO app_meta (key, value) VALUES ('streak_last_day', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, args: [today] },
-      { sql: `INSERT INTO app_meta (key, value) VALUES ('streak_best', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, args: [String(best)] },
-    ],
-    "write",
-  );
+  const upsert = `INSERT INTO app_meta (key, value) VALUES ($1, $2)
+                  ON CONFLICT(key) DO UPDATE SET value = excluded.value`;
+  await withTransaction(async (c) => {
+    await c.query(upsert, ["streak_current", String(next)]);
+    await c.query(upsert, ["streak_last_day", today]);
+    await c.query(upsert, ["streak_best", String(best)]);
+  });
 }
 
 // ---------- write: progress ----------
@@ -413,11 +404,11 @@ async function touchStreak(): Promise<void> {
 export async function recordExerciseResult(exerciseId: string, correct: boolean): Promise<void> {
   await execute(
     `INSERT INTO exercise_progress (user_key, exercise_id, correct_count, wrong_count, streak, last_result, last_seen_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      ON CONFLICT(user_key, exercise_id) DO UPDATE SET
-       correct_count = correct_count + excluded.correct_count,
-       wrong_count = wrong_count + excluded.wrong_count,
-       streak = CASE WHEN excluded.last_result = 1 THEN streak + 1 ELSE 0 END,
+       correct_count = exercise_progress.correct_count + excluded.correct_count,
+       wrong_count = exercise_progress.wrong_count + excluded.wrong_count,
+       streak = CASE WHEN excluded.last_result = 1 THEN exercise_progress.streak + 1 ELSE 0 END,
        last_result = excluded.last_result,
        last_seen_at = excluded.last_seen_at`,
     [LOCAL_USER, exerciseId, correct ? 1 : 0, correct ? 0 : 1, correct ? 1 : 0, correct ? 1 : 0, new Date().toISOString()],
@@ -427,13 +418,13 @@ export async function recordExerciseResult(exerciseId: string, correct: boolean)
 
 export async function recordVocabReview(vocabId: string, remembered: boolean): Promise<void> {
   const [existing] = await query<{ box: number }>(
-    `SELECT box FROM vocab_progress WHERE user_key = ? AND vocab_id = ?`,
+    `SELECT box FROM vocab_progress WHERE user_key = $1 AND vocab_id = $2`,
     [LOCAL_USER, vocabId],
   );
   const newBox = nextBox(Number(existing?.box ?? 0), remembered);
   await execute(
     `INSERT INTO vocab_progress (user_key, vocab_id, box, correct_count, wrong_count, due_at, last_seen_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      ON CONFLICT(user_key, vocab_id) DO UPDATE SET
        box = excluded.box,
        correct_count = vocab_progress.correct_count + excluded.correct_count,
@@ -452,10 +443,10 @@ export async function recordVocabReview(vocabId: string, remembered: boolean): P
 export async function recordLessonCompletion(lessonId: string, score: number): Promise<void> {
   await execute(
     `INSERT INTO lesson_progress (user_key, lesson_id, completed_at, score, attempts)
-     VALUES (?, ?, ?, ?, 1)
+     VALUES ($1, $2, $3, $4, 1)
      ON CONFLICT(user_key, lesson_id) DO UPDATE SET
        completed_at = COALESCE(excluded.completed_at, lesson_progress.completed_at),
-       score = MAX(lesson_progress.score, excluded.score),
+       score = GREATEST(lesson_progress.score, excluded.score),
        attempts = lesson_progress.attempts + 1`,
     [LOCAL_USER, lessonId, new Date().toISOString(), score],
   );
@@ -463,13 +454,10 @@ export async function recordLessonCompletion(lessonId: string, score: number): P
 }
 
 export async function resetProgress(): Promise<void> {
-  await getDb().batch(
-    [
-      { sql: `DELETE FROM exercise_progress WHERE user_key = ?`, args: [LOCAL_USER] },
-      { sql: `DELETE FROM vocab_progress WHERE user_key = ?`, args: [LOCAL_USER] },
-      { sql: `DELETE FROM lesson_progress WHERE user_key = ?`, args: [LOCAL_USER] },
-      { sql: `DELETE FROM app_meta WHERE key LIKE 'streak%'`, args: [] },
-    ],
-    "write",
-  );
+  await withTransaction(async (c) => {
+    await c.query(`DELETE FROM exercise_progress WHERE user_key = $1`, [LOCAL_USER]);
+    await c.query(`DELETE FROM vocab_progress WHERE user_key = $1`, [LOCAL_USER]);
+    await c.query(`DELETE FROM lesson_progress WHERE user_key = $1`, [LOCAL_USER]);
+    await c.query(`DELETE FROM app_meta WHERE key LIKE 'streak%'`);
+  });
 }
