@@ -20,7 +20,27 @@ function connectionString(): string {
       "Missing DATABASE_URL — run `neon link` (writes .env.local) or set it in your environment.",
     );
   }
-  return url;
+  return withExplicitSslMode(url);
+}
+
+/**
+ * Neon's pulled URLs ship `sslmode=require`. pg v8 treats that as `verify-full`
+ * (TLS + certificate verification) and prints a deprecation warning; pin
+ * `verify-full` explicitly — identical security, no warning, forward-compatible
+ * with pg v9's libpq-accurate semantics.
+ */
+function withExplicitSslMode(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const mode = parsed.searchParams.get("sslmode");
+    if (mode === "require" || mode === "prefer" || mode === "verify-ca") {
+      parsed.searchParams.set("sslmode", "verify-full");
+      return parsed.toString();
+    }
+    return url;
+  } catch {
+    return url;
+  }
 }
 
 const globalForDb = globalThis as unknown as {
