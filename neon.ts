@@ -6,9 +6,10 @@ export default defineConfig({
   // Branch policy: per-branch tuning
   branch: (branch) => {
     if (branch.isDefault) {
-      // Production branch: protected so it can never be deleted or reset by
-      // accident. Preview branches are cloned from it, which still works.
-      return { protected: true };
+      // Production branch: no tuning, uses the project defaults.
+      // (Neon's free plan does not allow marking branches as protected, so
+      // guard the production branch manually — never run `neon reset` on it.)
+      return {};
     }
     if (!branch.exists) {
       // New non-default branches (preview/*, created by

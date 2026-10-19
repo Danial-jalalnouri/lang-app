@@ -101,6 +101,17 @@ jobs:
             echo "Reusing Neon branch '$neon_branch' ($branch_id)"
           fi
 
+          # The branch must be ready before an endpoint can be attached to it.
+          for _ in $(seq 1 30); do
+            state="$(api "/projects/$NEON_PROJECT_ID/branches/$branch_id" | jq -r '.branch.current_state')"
+            [ "$state" = "ready" ] && break
+            sleep 2
+          done
+          if [ "$state" != "ready" ]; then
+            echo "::error::Neon branch '$neon_branch' is not ready (state: $state)"
+            exit 1
+          fi
+
           endpoint_id="$(api "/projects/$NEON_PROJECT_ID/branches/$branch_id/endpoints" \
             | jq -r '.endpoints[0].id // empty')"
 
@@ -108,15 +119,14 @@ jobs:
             echo "Creating compute endpoint..."
             payload="$(jq -n --arg b "$branch_id" --arg n "$neon_branch" --arg r "$NEON_REGION_ID" \
               '{endpoint: {branch_id: $b, name: $n, type: "read_write", region_id: $r}}')"
-            curl -sS -X POST -H "Authorization: Bearer $NEON_API_KEY" -H "Content-Type: application/json" \
-              -d "$payload" "$NEON_API_BASE/projects/$NEON_PROJECT_ID/endpoints" > /dev/null
+            response="$(curl -sS -X POST -H "Authorization: Bearer $NEON_API_KEY" -H "Content-Type: application/json" \
+              -d "$payload" "$NEON_API_BASE/projects/$NEON_PROJECT_ID/endpoints")"
+            endpoint_id="$(echo "$response" | jq -r '.endpoint.id // empty')"
+            if [ -z "$endpoint_id" ]; then
+              echo "::error::Failed to create compute endpoint for '$neon_branch': $response"
+              exit 1
+            fi
           fi
-
-          for _ in $(seq 1 30); do
-            state="$(api "/projects/$NEON_PROJECT_ID/branches/$branch_id" | jq -r '.branch.current_state')"
-            [ "$state" = "ready" ] && break
-            sleep 2
-          done
 
           uri() {
             api "/projects/$NEON_PROJECT_ID/connection_uri?branch_id=$branch_id&database_name=$NEON_DATABASE_NAME&role_name=$NEON_ROLE_NAME&pooled=$1" \
