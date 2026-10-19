@@ -1,0 +1,85 @@
+name: Neon preview cleanup
+
+# Removes the Neon branch and the branch-scoped Vercel env vars once the git
+# branch is gone (or the pull request was closed), so preview databases do not
+# accumulate.
+
+on:
+  pull_request:
+    types: [closed]
+  delete:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Git branch whose Neon branch should be removed"
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  cleanup:
+    name: Remove preview database
+    runs-on: ubuntu-latest
+    env:
+      NEON_API_BASE: https://console.neon.tech/api/v2
+      NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+      NEON_PROJECT_ID: ${{ vars.NEON_PROJECT_ID }}
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+      VERCEL_TEAM_ID: ${{ vars.VERCEL_TEAM_ID }}
+    steps:
+      - name: Resolve branch name
+        id: ctx
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            branch="${{ inputs.branch }}"
+          elif [ "${{ github.event_name }}" = "delete" ]; then
+            branch="${{ github.event.ref }}"
+          else
+            branch="${{ github.event.pull_request.head.ref }}"
+          fi
+
+          safe_branch="$(printf '%s' "$branch" | tr -c 'A-Za-z0-9._-' '-' | sed 's/^-*//; s/-*$//')"
+          neon_branch="preview/${safe_branch}"
+          neon_branch="${neon_branch:0:63}"
+
+          echo "git_branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "neon_branch=$neon_branch" >> "$GITHUB_OUTPUT"
+
+      - name: Delete the Neon branch
+        env:
+          NEON_BRANCH: ${{ steps.ctx.outputs.neon_branch }}
+        run: |
+          set -euo pipefail
+          branch_id="$(curl -sS -H "Authorization: Bearer $NEON_API_KEY" \
+            "$NEON_API_BASE/projects/$NEON_PROJECT_ID/branches" \
+            | jq -r --arg n "$NEON_BRANCH" '.branches[] | select(.name == $n) | .id' | head -n1)"
+          if [ -z "$branch_id" ]; then
+            echo "Neon branch '$NEON_BRANCH' does not exist — nothing to delete."
+            exit 0
+          fi
+          curl -sS -o /dev/null -w "Deleted Neon branch '$NEON_BRANCH' (%{http_code})\n" -X DELETE \
+            -H "Authorization: Bearer $NEON_API_KEY" \
+            "$NEON_API_BASE/projects/$NEON_PROJECT_ID/branches/$branch_id"
+
+      - name: Delete the branch-scoped Vercel env vars
+        env:
+          GIT_BRANCH: ${{ steps.ctx.outputs.git_branch }}
+        run: |
+          set -euo pipefail
+          ids="$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" -H "teamId: $VERCEL_TEAM_ID" \
+            "https://api.vercel.com/v9/projects/$VERCEL_PROJECT_ID/env" \
+            | jq -r --arg b "$GIT_BRANCH" \
+              '.envs[] | select(.gitBranch == $b) | select(.key == "DATABASE_URL" or .key == "DATABASE_URL_UNPOOLED" or .key == "NEON_BRANCH") | .id')"
+          if [ -z "$ids" ]; then
+            echo "No branch-scoped Vercel env vars for '$GIT_BRANCH'."
+            exit 0
+          fi
+          for id in $ids; do
+            curl -sS -o /dev/null -w "Deleted Vercel env var $id (%{http_code})\n" -X DELETE \
+              -H "Authorization: Bearer $VERCEL_TOKEN" -H "teamId: $VERCEL_TEAM_ID" \
+              "https://api.vercel.com/v9/projects/$VERCEL_PROJECT_ID/env/$id"
+          done

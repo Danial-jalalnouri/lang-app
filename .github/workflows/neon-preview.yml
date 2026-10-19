@@ -1,0 +1,218 @@
+name: Neon preview branch
+
+# Every push to a non-production branch gets its own Neon branch (a copy of the
+# production database) and its own Vercel preview deployment wired to it.
+#
+# Production deployments are NOT handled here: a push to `main` is deployed by
+# Vercel's native Git integration and keeps pointing at the production branch.
+
+on:
+  push:
+    branches-ignore:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: neon-preview-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    name: Provision Neon branch and deploy preview
+    runs-on: ubuntu-latest
+    env:
+      NEON_API_BASE: https://console.neon.tech/api/v2
+      NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+      NEON_PROJECT_ID: ${{ vars.NEON_PROJECT_ID }}
+      NEON_PARENT_BRANCH_ID: ${{ vars.NEON_PARENT_BRANCH_ID }}
+      NEON_DATABASE_NAME: ${{ vars.NEON_DATABASE_NAME }}
+      NEON_ROLE_NAME: ${{ vars.NEON_ROLE_NAME }}
+      NEON_REGION_ID: ${{ vars.NEON_REGION_ID }}
+      NEON_BRANCH_TTL_DAYS: ${{ vars.NEON_BRANCH_TTL_DAYS }}
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+      VERCEL_TEAM_ID: ${{ vars.VERCEL_TEAM_ID }}
+      VERCEL_ORG: ${{ vars.VERCEL_ORG }}
+      VERCEL_REPO: ${{ vars.VERCEL_REPO }}
+      VERCEL_PROJECT_NAME: ${{ vars.VERCEL_PROJECT_NAME }}
+    steps:
+      - name: Resolve branch context
+        id: ctx
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git_branch="${{ github.head_ref }}"
+            head_repo="${{ github.event.pull_request.head.repo.full_name }}"
+            base_repo="${{ github.event.pull_request.base.repo.full_name }}"
+          else
+            git_branch="${{ github.ref_name }}"
+            head_repo="${{ github.repository }}"
+            base_repo="${{ github.repository }}"
+          fi
+
+          if [ "$head_repo" != "$base_repo" ]; then
+            echo "::notice::Pull request comes from a fork ($head_repo). Fork branches cannot be scoped to a Vercel env var, so no preview database is provisioned."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Neon branch names allow [A-Za-z0-9._-] plus '/', max 63 chars.
+          safe_branch="$(printf '%s' "$git_branch" | tr -c 'A-Za-z0-9._-' '-' | sed 's/^-*//; s/-*$//')"
+          neon_branch="preview/${safe_branch}"
+          neon_branch="${neon_branch:0:63}"
+
+          echo "git_branch=$git_branch" >> "$GITHUB_OUTPUT"
+          echo "neon_branch=$neon_branch" >> "$GITHUB_OUTPUT"
+          echo "sha=${{ github.event.pull_request.head.sha || github.sha }}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Neon branch: $neon_branch (from git branch '$git_branch')"
+
+      - name: Provision Neon branch and resolve connection strings
+        id: neon
+        if: steps.ctx.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          neon_branch="${{ steps.ctx.outputs.neon_branch }}"
+          api() {
+            curl -sS -H "Authorization: Bearer $NEON_API_KEY" "$NEON_API_BASE$1"
+          }
+
+          branch_id="$(api "/projects/$NEON_PROJECT_ID/branches" \
+            | jq -r --arg n "$neon_branch" '.branches[] | select(.name == $n) | .id' | head -n1)"
+
+          if [ -z "$branch_id" ]; then
+            echo "Creating Neon branch '$neon_branch'..."
+            expires_at="$(date -u -d "+${NEON_BRANCH_TTL_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)"
+            payload="$(jq -n --arg n "$neon_branch" --arg p "$NEON_PARENT_BRANCH_ID" --arg e "$expires_at" \
+              '{branch: {name: $n, parent_id: $p, expires_at: $e}}')"
+            response="$(curl -sS -X POST -H "Authorization: Bearer $NEON_API_KEY" -H "Content-Type: application/json" \
+              -d "$payload" "$NEON_API_BASE/projects/$NEON_PROJECT_ID/branches")"
+            branch_id="$(echo "$response" | jq -r '.branch.id')"
+            if [ -z "$branch_id" ] || [ "$branch_id" = "null" ]; then
+              echo "::error::Failed to create Neon branch '$neon_branch': $response"
+              exit 1
+            fi
+          else
+            echo "Reusing Neon branch '$neon_branch' ($branch_id)"
+          fi
+
+          endpoint_id="$(api "/projects/$NEON_PROJECT_ID/branches/$branch_id/endpoints" \
+            | jq -r '.endpoints[0].id // empty')"
+
+          if [ -z "$endpoint_id" ]; then
+            echo "Creating compute endpoint..."
+            payload="$(jq -n --arg b "$branch_id" --arg n "$neon_branch" --arg r "$NEON_REGION_ID" \
+              '{endpoint: {branch_id: $b, name: $n, type: "read_write", region_id: $r}}')"
+            curl -sS -X POST -H "Authorization: Bearer $NEON_API_KEY" -H "Content-Type: application/json" \
+              -d "$payload" "$NEON_API_BASE/projects/$NEON_PROJECT_ID/endpoints" > /dev/null
+          fi
+
+          for _ in $(seq 1 30); do
+            state="$(api "/projects/$NEON_PROJECT_ID/branches/$branch_id" | jq -r '.branch.current_state')"
+            [ "$state" = "ready" ] && break
+            sleep 2
+          done
+
+          uri() {
+            api "/projects/$NEON_PROJECT_ID/connection_uri?branch_id=$branch_id&database_name=$NEON_DATABASE_NAME&role_name=$NEON_ROLE_NAME&pooled=$1" \
+              | jq -r '.uri // empty'
+          }
+
+          pooled_uri=""
+          direct_uri=""
+          for _ in $(seq 1 30); do
+            pooled_uri="$(uri true)"
+            direct_uri="$(uri false)"
+            [ -n "$pooled_uri" ] && [ -n "$direct_uri" ] && break
+            sleep 2
+          done
+
+          if [ -z "$pooled_uri" ] || [ -z "$direct_uri" ]; then
+            echo "::error::Could not resolve connection strings for Neon branch '$neon_branch'"
+            exit 1
+          fi
+
+          echo "branch_id=$branch_id" >> "$GITHUB_OUTPUT"
+          echo "pooled_uri=$pooled_uri" >> "$GITHUB_OUTPUT"
+          echo "direct_uri=$direct_uri" >> "$GITHUB_OUTPUT"
+
+      - name: Point the Vercel branch at the Neon branch
+        if: steps.ctx.outputs.skip != 'true'
+        env:
+          GIT_BRANCH: ${{ steps.ctx.outputs.git_branch }}
+          NEON_BRANCH_NAME: ${{ steps.ctx.outputs.neon_branch }}
+          POOLED_URI: ${{ steps.neon.outputs.pooled_uri }}
+          DIRECT_URI: ${{ steps.neon.outputs.direct_uri }}
+        run: |
+          set -euo pipefail
+          upsert() {
+            local key="$1" value="$2"
+            payload="$(jq -n --arg k "$key" --arg v "$value" --arg b "$GIT_BRANCH" \
+              '{key: $k, value: $v, type: "sensitive", target: ["preview"], gitBranch: $b}')"
+            code="$(curl -sS -o /tmp/env.json -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer $VERCEL_TOKEN" -H "Content-Type: application/json" \
+              -d "$payload" \
+              "https://api.vercel.com/v10/projects/$VERCEL_PROJECT_ID/env?upsert=true&teamId=$VERCEL_TEAM_ID")"
+            if [ "$code" != "200" ] && [ "$code" != "201" ]; then
+              echo "::error::Failed to set $key for branch $GIT_BRANCH (HTTP $code): $(cat /tmp/env.json)"
+              exit 1
+            fi
+          }
+
+          upsert DATABASE_URL "$POOLED_URI"
+          upsert DATABASE_URL_UNPOOLED "$DIRECT_URI"
+          upsert NEON_BRANCH "$NEON_BRANCH_NAME"
+          echo "Vercel env vars for '$GIT_BRANCH' now point at '$NEON_BRANCH_NAME'"
+
+      - name: Create the Vercel preview deployment
+        id: deploy
+        if: steps.ctx.outputs.skip != 'true'
+        env:
+          GIT_BRANCH: ${{ steps.ctx.outputs.git_branch }}
+          SHA: ${{ steps.ctx.outputs.sha }}
+        run: |
+          set -euo pipefail
+          payload="$(jq -n \
+            --arg name "$VERCEL_PROJECT_NAME" \
+            --arg project "$VERCEL_PROJECT_ID" \
+            --arg org "$VERCEL_ORG" \
+            --arg repo "$VERCEL_REPO" \
+            --arg ref "$GIT_BRANCH" \
+            --arg sha "$SHA" \
+            '{
+              name: $name,
+              project: $project,
+              gitSource: {type: "github", org: $org, repo: $repo, ref: $ref, sha: $sha},
+              gitMetadata: {remoteUrl: ("https://github.com/" + $org + "/" + $repo + ".git"), commitRef: $ref, commitSha: $sha}
+            }')"
+          response="$(curl -sS -X POST -H "Authorization: Bearer $VERCEL_TOKEN" -H "Content-Type: application/json" \
+            -d "$payload" "https://api.vercel.com/v13/deployments?teamId=$VERCEL_TEAM_ID")"
+          deployment_id="$(echo "$response" | jq -r '.id // empty')"
+          deployment_url="$(echo "$response" | jq -r '.url // empty')"
+          if [ -z "$deployment_id" ]; then
+            echo "::error::Failed to create preview deployment: $response"
+            exit 1
+          fi
+          echo "deployment_id=$deployment_id" >> "$GITHUB_OUTPUT"
+          echo "deployment_url=https://$deployment_url" >> "$GITHUB_OUTPUT"
+          echo "Preview deployment: https://$deployment_url"
+
+      - name: Comment on the pull request
+        if: steps.ctx.outputs.skip != 'true' && github.event_name == 'pull_request'
+        env:
+          DEPLOYMENT_URL: ${{ steps.deploy.outputs.deployment_url }}
+          NEON_BRANCH_NAME: ${{ steps.ctx.outputs.neon_branch }}
+        run: |
+          set -euo pipefail
+          body="$(printf '### Vercel preview\n\n- Preview: %s\n- Neon branch: `%s`\n' "$DEPLOYMENT_URL" "$NEON_BRANCH_NAME")"
+          payload="$(jq -n --arg body "$body" '{body: $body}')"
+          curl -sS -o /dev/null -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" -H "Accept: application/vnd.github+json" \
+            -d "$payload" \
+            "${{ github.event.pull_request.comments_url }}"
