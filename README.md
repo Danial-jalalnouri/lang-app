@@ -62,6 +62,53 @@ src/content/
   code deploys to Vercel as-is
 - **Neon branch policy** — `neon.ts` + `neon deploy` manage branch settings; current
   branch is `production` (shown in Settings)
+
+## Deployments & databases
+
+Each deployed environment gets its **own Neon branch** (a copy-on-write clone of
+production), so a preview can never read or write production data.
+
+| Environment | Who deploys | Database |
+|---|---|---|
+| Production (`main`) | Vercel's native Git integration | Neon `production` branch |
+| Preview (any other branch) | `.github/workflows/neon-preview.yml` | Neon `preview/<git-branch>` branch |
+
+**How a preview works** — on every push to a non-`main` branch the workflow:
+
+1. creates (or reuses) the Neon branch `preview/<git-branch>` from `production`,
+   with a compute endpoint and a 7-day expiry;
+2. points `DATABASE_URL`, `DATABASE_URL_UNPOOLED` and `NEON_BRANCH` at that branch
+   using **branch-scoped Vercel env vars** (`target=preview`, `gitBranch=<branch>`);
+3. creates the Vercel preview deployment from the pushed commit.
+
+Vercel's native preview deployments are **disabled** for this project
+(`previewDeploymentsDisabled`), so the workflow is the single deployer for previews
+and each push produces exactly one deployment. Production is untouched: the
+project-level `DATABASE_URL` / `DATABASE_URL_UNPOOLED` / `NEON_BRANCH` target
+`production` only, so a preview without its branch-scoped vars has no database at
+all rather than production's.
+
+**Cleanup** — `.github/workflows/neon-preview-cleanup.yml` deletes the Neon branch and
+the branch-scoped env vars when the git branch is deleted or the PR is closed.
+Branches also auto-expire after 7 days.
+
+**Required repository configuration** (already set for `lang-app`):
+
+- Secrets: `NEON_API_KEY` (project-scoped Neon key), `VERCEL_TOKEN`
+- Variables: `NEON_PROJECT_ID`, `NEON_PARENT_BRANCH_ID`, `NEON_DATABASE_NAME`,
+  `NEON_ROLE_NAME`, `NEON_REGION_ID`, `NEON_BRANCH_TTL_DAYS`, `VERCEL_PROJECT_ID`,
+  `VERCEL_TEAM_ID`, `VERCEL_ORG`, `VERCEL_REPO`, `VERCEL_PROJECT_NAME`
+
+**Caveats**
+
+- Pull requests from forks are skipped — Vercel env vars cannot be scoped to a
+  branch that does not exist in the connected repository.
+- The Neon Marketplace integration is *not* used for this project; the workflow
+  owns branch provisioning. Do not connect it here as well or both would set
+  `DATABASE_URL`.
+- `VERCEL_TOKEN` is currently a personal Vercel token. Swap it for a
+  project-scoped token (Vercel → Settings → Tokens) if you want tighter scoping.
+
 - **Server Functions** (`src/app/actions.ts`) record answers, flashcard reviews, lesson
   completions, the daily streak, and reset progress
 - **DB reads** sit behind `await connection()` inside `<Suspense>`: static shell, fresh data
