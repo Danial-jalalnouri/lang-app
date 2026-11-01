@@ -18,9 +18,14 @@ async function DashboardView() {
   await connection();
   const userId = await requireUserId();
   const data = await getDashboard(userId);
-  if (!(await isSuperUser(userId))) {
+  const superUser = await isSuperUser(userId);
+  if (!superUser) {
     data.units = data.units.slice(0, 1);
   }
+  const checkoutBase = process.env.LEMONSQUEEZY_CHECKOUT_URL;
+  const checkoutUrl = checkoutBase
+    ? `${checkoutBase}${checkoutBase.includes("?") ? "&" : "?"}checkout[custom][user_id]=${encodeURIComponent(userId)}`
+    : null;
 
   if (data.units.length === 0) {
     return (
@@ -62,6 +67,27 @@ async function DashboardView() {
           </span>
         }
       />
+
+      {!superUser && checkoutUrl && (
+        <Card className="mb-6 border-amber-200 bg-amber-50">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="font-semibold">Unlock all units</h2>
+              <p className="mt-1 text-sm text-zinc-600">
+                Upgrade to Super to access every unit and the full course.
+              </p>
+            </div>
+            <a
+              href={checkoutUrl}
+              className={buttonClass("primary")}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Upgrade →
+            </a>
+          </div>
+        </Card>
+      )}
 
       <div className="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
         <Stat label="Units completed" value={`${data.units.filter((u) => u.completedLessons === u.totalLessons).length}/${data.units.length}`} />
