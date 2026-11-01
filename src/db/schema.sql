@@ -98,8 +98,20 @@ CREATE TABLE IF NOT EXISTS lesson_progress (
   PRIMARY KEY (user_key, lesson_id)
 );
 
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  email TEXT,
+  first_name TEXT,
+  last_name TEXT,
+  username TEXT,
+  image_url TEXT,
+  created_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE INDEX IF NOT EXISTS idx_vocabulary_unit ON vocabulary(unit_id);
 CREATE INDEX IF NOT EXISTS idx_lessons_unit ON lessons(unit_id);
 CREATE INDEX IF NOT EXISTS idx_grammar_lesson ON grammar_rules(lesson_id);
 CREATE INDEX IF NOT EXISTS idx_exercises_lesson ON exercises(lesson_id);
 CREATE INDEX IF NOT EXISTS idx_vocab_progress_due ON vocab_progress(user_key, due_at);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);

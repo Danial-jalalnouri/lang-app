@@ -4,6 +4,7 @@ import { Geist, Geist_Mono } from "next/font/google";
 import Link from "next/link";
 import { Suspense } from "react";
 import { AuthButtons } from "@/components/AuthButtons";
+import { isOrgAdmin } from "@/lib/admin";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -54,6 +55,9 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
                     {l.label}
                   </Link>
                 ))}
+                <Suspense fallback={null}>
+                  <AdminNavLink />
+                </Suspense>
                 {/* Show reads auth state server-side; Suspense keeps the layout prerenderable. */}
                 <Suspense fallback={<AuthButtons />}>
                   <Show
@@ -77,5 +81,18 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
         </ClerkProvider>
       </body>
     </html>
+  );
+}
+
+async function AdminNavLink() {
+  const admin = await isOrgAdmin();
+  if (!admin) return null;
+  return (
+    <Link
+      href="/admin"
+      className="rounded-md px-3 py-1.5 text-zinc-600 transition hover:bg-zinc-100 hover:text-zinc-900"
+    >
+      Admin
+    </Link>
   );
 }

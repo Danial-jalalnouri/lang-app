@@ -1,4 +1,5 @@
 import { auth } from "@clerk/nextjs/server";
+import { syncUser } from "@/lib/user-sync";
 
 /**
  * Resource-based auth (Clerk v7 pattern): redirects signed-out document
@@ -6,5 +7,6 @@ import { auth } from "@clerk/nextjs/server";
  */
 export async function requireUserId(): Promise<string> {
   const { userId } = await auth.protect();
+  await syncUser(userId);
   return userId;
 }

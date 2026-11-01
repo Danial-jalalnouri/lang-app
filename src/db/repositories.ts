@@ -484,3 +484,81 @@ export async function resetProgress(userId: string): Promise<void> {
     await c.query(`DELETE FROM app_meta WHERE key = $1`, [streakKey(userId)]);
   });
 }
+
+// ---------- users ----------
+
+export interface DbUser {
+  id: string;
+  email: string | null;
+  firstName: string | null;
+  lastName: string | null;
+  username: string | null;
+  imageUrl: string | null;
+  createdAt: Date | null;
+  updatedAt: Date | null;
+}
+
+interface UserRow {
+  id: string;
+  email: string | null;
+  first_name: string | null;
+  last_name: string | null;
+  username: string | null;
+  image_url: string | null;
+  created_at: Date | null;
+  updated_at: Date | null;
+}
+
+function parseUser(row: UserRow): DbUser {
+  return {
+    id: row.id,
+    email: row.email,
+    firstName: row.first_name,
+    lastName: row.last_name,
+    username: row.username,
+    imageUrl: row.image_url,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export async function upsertUser(u: {
+  id: string;
+  email?: string | null;
+  firstName?: string | null;
+  lastName?: string | null;
+  username?: string | null;
+  imageUrl?: string | null;
+  createdAt?: Date | string | null;
+}): Promise<void> {
+  await execute(
+    `INSERT INTO users (id, email, first_name, last_name, username, image_url, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+     ON CONFLICT (id) DO UPDATE SET
+       email = excluded.email,
+       first_name = excluded.first_name,
+       last_name = excluded.last_name,
+       username = excluded.username,
+       image_url = excluded.image_url,
+       updated_at = now()`,
+    [
+      u.id,
+      u.email ?? null,
+      u.firstName ?? null,
+      u.lastName ?? null,
+      u.username ?? null,
+      u.imageUrl ?? null,
+      u.createdAt ? new Date(u.createdAt).toISOString() : null,
+    ],
+  );
+}
+
+export async function getUser(id: string): Promise<DbUser | null> {
+  const rows = await query<UserRow>("SELECT * FROM users WHERE id = $1", [id]);
+  return rows[0] ? parseUser(rows[0]) : null;
+}
+
+export async function listUsers(): Promise<DbUser[]> {
+  const rows = await query<UserRow>("SELECT * FROM users ORDER BY created_at DESC NULLS LAST, id");
+  return rows.map(parseUser);
+}
