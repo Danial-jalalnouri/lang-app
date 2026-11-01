@@ -494,6 +494,7 @@ export interface DbUser {
   lastName: string | null;
   username: string | null;
   imageUrl: string | null;
+  accountType: string;
   createdAt: Date | null;
   updatedAt: Date | null;
 }
@@ -505,6 +506,7 @@ interface UserRow {
   last_name: string | null;
   username: string | null;
   image_url: string | null;
+  account_type: string;
   created_at: Date | null;
   updated_at: Date | null;
 }
@@ -517,6 +519,7 @@ function parseUser(row: UserRow): DbUser {
     lastName: row.last_name,
     username: row.username,
     imageUrl: row.image_url,
+    accountType: row.account_type ?? "standard",
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -561,4 +564,32 @@ export async function getUser(id: string): Promise<DbUser | null> {
 export async function listUsers(): Promise<DbUser[]> {
   const rows = await query<UserRow>("SELECT * FROM users ORDER BY created_at DESC NULLS LAST, id");
   return rows.map(parseUser);
+}
+
+export async function updateUserAccountType(userId: string, accountType: "standard" | "super"): Promise<void> {
+  await execute(`UPDATE users SET account_type = $2, updated_at = now() WHERE id = $1`, [userId, accountType]);
+}
+
+export async function getUnitIdForLesson(lessonId: string): Promise<string | null> {
+  const rows = await query<{ unit_id: string }>(
+    `SELECT unit_id FROM lessons WHERE id = $1`,
+    [lessonId],
+  );
+  return rows[0]?.unit_id ?? null;
+}
+
+export async function getUnitIdForExercise(exerciseId: string): Promise<string | null> {
+  const rows = await query<{ unit_id: string }>(
+    `SELECT l.unit_id FROM exercises e JOIN lessons l ON l.id = e.lesson_id WHERE e.id = $1`,
+    [exerciseId],
+  );
+  return rows[0]?.unit_id ?? null;
+}
+
+export async function getUnitIdForVocab(vocabId: string): Promise<string | null> {
+  const rows = await query<{ unit_id: string }>(
+    `SELECT unit_id FROM vocabulary WHERE id = $1`,
+    [vocabId],
+  );
+  return rows[0]?.unit_id ?? null;
 }

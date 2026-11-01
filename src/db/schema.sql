@@ -105,10 +105,12 @@ CREATE TABLE IF NOT EXISTS users (
   last_name TEXT,
   username TEXT,
   image_url TEXT,
+  account_type TEXT NOT NULL DEFAULT 'standard',
   created_at TIMESTAMPTZ,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE users ADD COLUMN IF NOT EXISTS account_type TEXT NOT NULL DEFAULT 'standard';
 CREATE INDEX IF NOT EXISTS idx_vocabulary_unit ON vocabulary(unit_id);
 CREATE INDEX IF NOT EXISTS idx_lessons_unit ON lessons(unit_id);
 CREATE INDEX IF NOT EXISTS idx_grammar_lesson ON grammar_rules(lesson_id);

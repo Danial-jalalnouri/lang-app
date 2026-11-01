@@ -3,6 +3,7 @@ import { Suspense } from "react";
 import { connection } from "next/server";
 import { requireUserId } from "@/lib/authz";
 import { getDashboard } from "@/db/repositories";
+import { isSuperUser } from "@/lib/access";
 import { Card, LinkButton, PageHeader, ProgressBar, Stat, buttonClass, cn } from "@/components/ui";
 
 export default function DashboardPage() {
@@ -17,6 +18,9 @@ async function DashboardView() {
   await connection();
   const userId = await requireUserId();
   const data = await getDashboard(userId);
+  if (!(await isSuperUser(userId))) {
+    data.units = data.units.slice(0, 1);
+  }
 
   if (data.units.length === 0) {
     return (

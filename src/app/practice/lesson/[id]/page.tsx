@@ -3,6 +3,8 @@ import { Suspense } from "react";
 import { connection } from "next/server";
 import { requireUserId } from "@/lib/authz";
 import { getLesson } from "@/db/repositories";
+import { canAccessUnit } from "@/lib/access";
+import { redirect } from "next/navigation";
 import { ExerciseRunner } from "@/components/ExerciseRunner";
 import { buttonClass } from "@/components/ui";
 import { PracticeSkeleton } from "@/components/PracticeSkeleton";
@@ -20,6 +22,10 @@ async function LessonPracticeView({ params }: { params: Promise<{ id: string }> 
   const { id } = await params;
   const userId = await requireUserId();
   const lesson = await getLesson(userId, id);
+
+  if (lesson && !(await canAccessUnit(userId, lesson.unit.id))) {
+    redirect("/");
+  }
 
   if (!lesson) {
     return (

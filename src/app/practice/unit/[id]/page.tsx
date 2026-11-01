@@ -2,6 +2,9 @@ import Link from "next/link";
 import { Suspense } from "react";
 import { connection } from "next/server";
 import { getUnitExercises } from "@/db/repositories";
+import { requireUserId } from "@/lib/authz";
+import { canAccessUnit } from "@/lib/access";
+import { redirect } from "next/navigation";
 import { ExerciseRunner } from "@/components/ExerciseRunner";
 import { buttonClass } from "@/components/ui";
 import { PracticeSkeleton } from "@/components/PracticeSkeleton";
@@ -17,6 +20,10 @@ export default function UnitPracticePage({ params }: { params: Promise<{ id: str
 async function UnitPracticeView({ params }: { params: Promise<{ id: string }> }) {
   await connection();
   const { id } = await params;
+  const userId = await requireUserId();
+  if (!(await canAccessUnit(userId, id))) {
+    redirect("/");
+  }
   const data = await getUnitExercises(id);
 
   if (!data) {

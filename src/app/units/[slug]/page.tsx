@@ -3,6 +3,8 @@ import { Suspense } from "react";
 import { connection } from "next/server";
 import { requireUserId } from "@/lib/authz";
 import { getUnit } from "@/db/repositories";
+import { canAccessUnit } from "@/lib/access";
+import { redirect } from "next/navigation";
 import { Card, LinkButton, PageHeader, ProgressBar, buttonClass } from "@/components/ui";
 
 export default function UnitPage({ params }: { params: Promise<{ slug: string }> }) {
@@ -18,6 +20,10 @@ async function UnitView({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
   const userId = await requireUserId();
   const unit = await getUnit(userId, slug);
+
+  if (unit && !(await canAccessUnit(userId, unit.unit.id))) {
+    redirect("/");
+  }
 
   if (!unit) {
     return (

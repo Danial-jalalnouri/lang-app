@@ -3,6 +3,8 @@ import { Suspense } from "react";
 import { connection } from "next/server";
 import { requireUserId } from "@/lib/authz";
 import { getLesson } from "@/db/repositories";
+import { canAccessUnit } from "@/lib/access";
+import { redirect } from "next/navigation";
 import { FlashcardReview } from "@/components/FlashcardReview";
 import { buttonClass } from "@/components/ui";
 
@@ -23,6 +25,10 @@ async function LessonFlashcardsView({ params }: { params: Promise<{ id: string }
   const { id } = await params;
   const userId = await requireUserId();
   const lesson = await getLesson(userId, id);
+
+  if (lesson && !(await canAccessUnit(userId, lesson.unit.id))) {
+    redirect("/");
+  }
 
   if (!lesson) {
     return (
