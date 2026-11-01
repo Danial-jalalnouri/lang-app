@@ -495,6 +495,9 @@ export interface DbUser {
   username: string | null;
   imageUrl: string | null;
   accountType: string;
+  lemonSubscriptionId: string | null;
+  subscriptionStatus: string | null;
+  subscriptionEndsAt: Date | null;
   createdAt: Date | null;
   updatedAt: Date | null;
 }
@@ -507,6 +510,9 @@ interface UserRow {
   username: string | null;
   image_url: string | null;
   account_type: string;
+  lemon_subscription_id: string | null;
+  subscription_status: string | null;
+  subscription_ends_at: Date | null;
   created_at: Date | null;
   updated_at: Date | null;
 }
@@ -520,6 +526,9 @@ function parseUser(row: UserRow): DbUser {
     username: row.username,
     imageUrl: row.image_url,
     accountType: row.account_type ?? "standard",
+    lemonSubscriptionId: row.lemon_subscription_id,
+    subscriptionStatus: row.subscription_status,
+    subscriptionEndsAt: row.subscription_ends_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -568,6 +577,16 @@ export async function listUsers(): Promise<DbUser[]> {
 
 export async function updateUserAccountType(userId: string, accountType: "standard" | "super"): Promise<void> {
   await execute(`UPDATE users SET account_type = $2, updated_at = now() WHERE id = $1`, [userId, accountType]);
+}
+
+export async function updateUserSubscription(
+  userId: string,
+  info: { subscriptionId: string | null; status: string | null; endsAt: Date | string | null },
+): Promise<void> {
+  await execute(
+    `UPDATE users SET lemon_subscription_id = $2, subscription_status = $3, subscription_ends_at = $4, updated_at = now() WHERE id = $1`,
+    [userId, info.subscriptionId, info.status, info.endsAt ? new Date(info.endsAt).toISOString() : null],
+  );
 }
 
 export async function getUnitIdForLesson(lessonId: string): Promise<string | null> {

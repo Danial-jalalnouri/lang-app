@@ -106,11 +106,17 @@ CREATE TABLE IF NOT EXISTS users (
   username TEXT,
   image_url TEXT,
   account_type TEXT NOT NULL DEFAULT 'standard',
+  lemon_subscription_id TEXT,
+  subscription_status TEXT,
+  subscription_ends_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS account_type TEXT NOT NULL DEFAULT 'standard';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS lemon_subscription_id TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_status TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_ends_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_vocabulary_unit ON vocabulary(unit_id);
 CREATE INDEX IF NOT EXISTS idx_lessons_unit ON lessons(unit_id);
 CREATE INDEX IF NOT EXISTS idx_grammar_lesson ON grammar_rules(lesson_id);

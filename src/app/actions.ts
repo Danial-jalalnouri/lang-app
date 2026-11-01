@@ -10,6 +10,8 @@ import {
   recordLessonCompletion,
   resetProgress,
   updateUserAccountType,
+  updateUserSubscription,
+  getUser,
   getUnitIdForExercise,
   getUnitIdForVocab,
   getUnitIdForLesson,
@@ -63,4 +65,34 @@ export async function setUserAccountType(userId: string, accountType: "standard"
   await requireAdmin();
   await updateUserAccountType(userId, accountType);
   revalidatePath("/admin");
+}
+
+export async function cancelSubscription(): Promise<void> {
+  const userId = await requireUserId();
+  const user = await getUser(userId);
+  if (!user?.lemonSubscriptionId) {
+    throw new Error("No active subscription");
+  }
+  const apiKey = process.env.LEMONSQUEEZY_API_KEY;
+  if (!apiKey) {
+    throw new Error("Billing not configured");
+  }
+  const res = await fetch(`https://api.lemonsqueezy.com/v1/subscriptions/${user.lemonSubscriptionId}`, {
+    method: "DELETE",
+    headers: {
+      Accept: "application/vnd.api+json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || "Cancellation failed");
+  }
+  await updateUserSubscription(userId, {
+    subscriptionId: user.lemonSubscriptionId,
+    status: "cancelled",
+    endsAt: user.subscriptionEndsAt,
+  });
+  revalidatePath("/settings");
+  revalidatePath("/");
 }

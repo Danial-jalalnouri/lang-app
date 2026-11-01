@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import crypto from "node:crypto";
-import { updateUserAccountType } from "@/db/repositories";
+import { updateUserAccountType, updateUserSubscription } from "@/db/repositories";
 
 function getRawSignature(headers: Headers): string | null {
   return headers.get("x-signature");
@@ -37,6 +37,22 @@ function subscriptionStatus(payload: unknown): string {
   return String(attrs.status ?? "");
 }
 
+function subscriptionId(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const p = payload as Record<string, unknown>;
+  const data = (p.data as Record<string, unknown> | undefined) ?? {};
+  return data.id ? String(data.id) : null;
+}
+
+function subscriptionEndsAt(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const p = payload as Record<string, unknown>;
+  const data = (p.data as Record<string, unknown> | undefined) ?? {};
+  const attrs = (data.attributes as Record<string, unknown> | undefined) ?? {};
+  const v = attrs.ends_at ?? attrs.renews_at ?? null;
+  return v ? String(v) : null;
+}
+
 export async function POST(req: Request): Promise<Response> {
   const secret = process.env.LEMONSQUEEZY_WEBHOOK_SECRET;
   if (!secret) {
@@ -68,16 +84,17 @@ export async function POST(req: Request): Promise<Response> {
 
   const event = eventName(payload);
   const status = subscriptionStatus(payload);
+  const subId = subscriptionId(payload);
+  const endsAt = subscriptionEndsAt(payload);
+
+  if (subId) {
+    await updateUserSubscription(userId, { subscriptionId: subId, status, endsAt });
+  }
 
   const activeStatuses = new Set(["active", "on_trial", "trialling", "past_due"]);
-  const expiredEvents = new Set([
-    "subscription_expired",
-    "subscription_cancelled",
-  ]);
-
   if (activeStatuses.has(status) || event === "subscription_created" || event === "subscription_resumed") {
     await updateUserAccountType(userId, "super");
-  } else if (expiredEvents.has(event) || status === "expired") {
+  } else if (event === "subscription_expired" || status === "expired") {
     await updateUserAccountType(userId, "standard");
   }
 
